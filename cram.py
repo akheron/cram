@@ -155,34 +155,83 @@ def test(path, indent=2, shell='/bin/sh'):
     indent = ' ' * indent
     cmdline = '%s$ ' % indent
     conline = '%s> ' % indent
+    cmdline_input = '%s@ ' % indent
+    inputline = '%s= ' % indent
 
     f = open(path)
+
+    # Scan the test file to see how many input pipes we need
+    commands_reading_input = 0
+    for line in f:
+        if line.startswith(cmdline_input):
+            commands_reading_input += 1
+    f.seek(0)
+
+    if commands_reading_input > 1000:
+        # Just to make sure we don't create vast amount of pipes
+        raise RuntimeError('Too many commands with input')
+
+    pipe_fds = [os.pipe() for x in range(commands_reading_input)]
+
     abspath = os.path.abspath(path)
     env = os.environ.copy()
     env['TESTDIR'] = os.path.dirname(abspath)
+
+    # Close write end of each pipe in the child
+    def preexec_fn():
+        for pipe_r, pipe_w in pipe_fds:
+            os.close(pipe_w)
+
     p = subprocess.Popen([shell, '-'], bufsize=-1, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          universal_newlines=True, env=env,
-                         close_fds=os.name == 'posix')
+                         close_fds=False,
+                         preexec_fn=preexec_fn)
+
+    # Close read end of each pipe in the parent process and create
+    # file objects for the write ends
+    pipes = []
+    for pipe_r, pipe_w in pipe_fds:
+        os.close(pipe_r)
+        pipes.append(os.fdopen(pipe_w, 'w'))
+
     salt = 'CRAM%s' % time.time()
 
     after = {}
     refout, postout = [], []
     i = pos = prepos = -1
+    pipe_index = 0
     for i, line in enumerate(f):
         refout.append(line)
-        if line.startswith(cmdline):
+        if line.startswith(cmdline) or line.startswith(cmdline_input):
             after.setdefault(pos, []).append(line)
             prepos = pos
             pos = i
             p.stdin.write('echo "\n%s %s $?"\n' % (salt, i))
-            p.stdin.write(line[len(cmdline):])
+            if line.startswith(cmdline):
+                p.stdin.write(line[len(cmdline):])
+            else:
+                # Close previous pipe
+                if pipe_index > 0:
+                    pipes[pipe_index - 1].close()
+
+                # Redirect stdin from our input pipe
+                p.stdin.write(line[len(cmdline):-1] +
+                              ' <&%d\n' % pipe_fds[pipe_index][0])
+                pipe_index += 1
         elif line.startswith(conline):
             after.setdefault(prepos, []).append(line)
             p.stdin.write(line[len(conline):])
+        elif line.startswith(inputline):
+            after.setdefault(prepos, []).append(line)
+            pipes[pipe_index - 1].write(line[len(inputline):])
         elif not line.startswith(indent):
             after.setdefault(pos, []).append(line)
     p.stdin.write('echo "\n%s %s $?"\n' % (salt, i + 1))
+
+    # Close the last pipe
+    if pipes:
+        pipes[-1].close()
 
     output = p.communicate()[0]
     if p.returncode == 80:
